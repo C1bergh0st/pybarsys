@@ -255,6 +255,37 @@ urlpatterns = [
         views.UserStatisticsByAccountBalance.as_view(),
         name="admin_user_statistics_by_account_balance",
     ),
+    # PeriodInvoice
+    url(
+        r"^admin/periodinvoice/list/$",
+        views.PeriodInvoiceListView.as_view(),
+        name="admin_periodinvoice_list",
+    ),
+    url(
+        r"^admin/periodinvoice/new/now/$",
+        views.PeriodInvoiceCreateUntilNowView.as_view(),
+        name="admin_periodinvoice_new_until_now",
+    ),
+    url(
+        r"^admin/periodinvoice/new/until/$",
+        views.PeriodInvoiceCreateUntilView.as_view(),
+        name="admin_periodinvoice_new_until",
+    ),
+    url(
+        r"^admin/periodinvoice/(?P<pk>[0-9]+)/detail/$",
+        views.PeriodInvoiceDetailView.as_view(),
+        name="admin_periodinvoice_detail",
+    ),
+    url(
+        r"^admin/periodinvoice/(?P<pk>[0-9]+)/pdf/$",
+        views.PeriodInvoicePdfView.as_view(),
+        name="admin_periodinvoice_pdf",
+    ),
+    url(
+        r"^admin/periodinvoice/(?P<pk>[0-9]+)/delete/$",
+        views.PeriodInvoiceDeleteView.as_view(),
+        name="admin_periodinvoice_delete",
+    ),
     # ProductChangeAction
     url(
         r"^admin/productautochangeset/list/$",

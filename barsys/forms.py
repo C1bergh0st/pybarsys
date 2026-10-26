@@ -4,6 +4,7 @@ from crispy_forms import layout
 from crispy_forms.helper import FormHelper
 from django import forms
 from django.contrib.auth import forms as auth_forms
+from django.core.exceptions import ValidationError
 from django.utils.translation import gettext_lazy as _
 
 from .models import *
@@ -648,3 +649,51 @@ class SiteSettingsForm(forms.ModelForm):
                 "easyverein_finalize_invoices",
             ):
                 self.fields.pop(field_name, None)
+
+
+class PeriodInvoiceCreateForm(forms.ModelForm):
+    """For a period invoice until now"""
+
+    class Meta:
+        model = PeriodInvoice
+        fields = ["comment"]
+        widgets = {"comment": forms.Textarea(attrs={"rows": 3})}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["comment"].help_text = "Optional, shown on the invoice"
+        self.helper = FormHelper(form=self)
+        self.helper.add_input(layout.Submit("create", "Create invoice"))
+
+
+class PeriodInvoiceCreateUntilForm(PeriodInvoiceCreateForm):
+    """For a period invoice until a chosen date and time"""
+
+    class Meta(PeriodInvoiceCreateForm.Meta):
+        fields = ["period_end", "comment"]
+        labels = {"period_end": "Until"}
+        widgets = {
+            **PeriodInvoiceCreateForm.Meta.widgets,
+            "period_end": forms.DateTimeInput(
+                attrs={"type": "datetime-local", "step": "1"},
+                format="%Y-%m-%dT%H:%M:%S",
+            ),
+        }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["period_end"].help_text = (
+            "Purchases up to and including this time are included. The invoice starts "
+            "where the previous one before it ends."
+        )
+        self.helper.inputs.insert(
+            0, layout.Submit("preview", "Update preview", css_class="btn-default")
+        )
+
+    def clean_period_end(self):
+        period_end = self.cleaned_data["period_end"].replace(microsecond=0)
+        try:
+            PeriodInvoice.objects.check_period_end(period_end)
+        except ValidationError as e:
+            raise ValidationError(e.messages)
+        return period_end

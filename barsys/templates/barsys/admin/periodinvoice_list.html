@@ -1,0 +1,64 @@
+{% extends 'barsys/admin/list_base.html' %}
+
+{% load bootstrap3 %}
+{% load barsys_helpers %}
+
+{% block above_table %}
+    <h1 class="pull-left" style="margin-top: 0;">Invoices by period</h1>
+    <div class="btn-group pull-right" role="group">
+        <a href="{% url 'admin_periodinvoice_new_until_now' %}" class="btn btn-primary">
+            {% bootstrap_icon 'plus' %} Create invoice until now
+        </a>
+        <a href="{% url 'admin_periodinvoice_new_until' %}" class="btn btn-default">
+            {% bootstrap_icon 'calendar' %} Create invoice until date &amp; time
+        </a>
+    </div>
+{% endblock %}
+{% block tablehead %}
+    <tr>
+        <th>#</th>
+        <th>From</th>
+        <th>To</th>
+        <th>Users</th>
+        <th>Total sales</th>
+        <th>Comment</th>
+        <th></th>
+    </tr>
+{% endblock %}
+{% block tablebody %}
+    {% for period_invoice in object_list %}
+        <tr>
+            <td><a href="{% url 'admin_periodinvoice_detail' period_invoice.pk %}">{{ period_invoice.pk }}</a></td>
+            <td>{{ period_invoice.period_start|default_if_none:"First purchase" }}</td>
+            <td>{{ period_invoice.period_end }}</td>
+            <td>{{ period_invoice.lines.count }}</td>
+            <td>{{ period_invoice.totals.total_sales|currency }}</td>
+            <td>{{ period_invoice.comment|truncatechars:40 }}</td>
+            <td class="text-right">
+                <a href="{% url 'admin_periodinvoice_pdf' period_invoice.pk %}" target="_blank"
+                   class="btn btn-default btn-xs">{% bootstrap_icon 'file' %} PDF</a>
+                <a href="{% url 'admin_periodinvoice_delete' period_invoice.pk %}"
+                   class="btn btn-danger btn-xs">{% bootstrap_icon 'remove-sign' %} Delete</a>
+            </td>
+        </tr>
+    {% empty %}
+        <tr>
+            <td colspan="7">No invoices yet.</td>
+        </tr>
+    {% endfor %}
+{% endblock %}
+
+{% block additional_content %}
+    <div class="col-md-6">
+        <h2>Explanation</h2>
+        <p class="text-justify">
+            An invoice by period sums up the purchases of each user over a period. It either ends now or at a
+            date and time you choose, and starts where the previous invoice before it ends (the first one covers all
+            purchases before it). Free item purchases are not included.<br/>
+            The sums are fixed when the invoice is created. Unlike the per-user invoices, creating one does not bill
+            any purchases and does not change account balances.<br/>
+            Periods never overlap. Deleting an invoice leaves a gap, which an invoice until the deleted one's end
+            covers again.
+        </p>
+    </div>
+{% endblock %}

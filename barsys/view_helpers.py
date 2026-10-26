@@ -1,3 +1,4 @@
+import io
 import os.path
 from collections import OrderedDict
 from itertools import groupby
@@ -9,10 +10,18 @@ from django.core.mail import EmailMultiAlternatives
 from django.db import models
 from django.template.loader import render_to_string
 from django.utils import timezone
+from django.utils.html import escape
+from django.utils.timezone import localtime
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from pybarsys import settings as pybarsys_settings
 from pybarsys.settings import PybarsysPreferences
-from .models import StatsDisplay, Purchase, Invoice, Product, User
+from .models import StatsDisplay, Purchase, Invoice, PeriodInvoice, Product, User
+from .templatetags.barsys_helpers import currency, sdatetime
 
 
 def get_renderable_stats_elements():
@@ -581,3 +590,114 @@ def get_most_bought_product_for_users(users):
         most_bought_product = {"product_amount": "", "product_name": ""}
 
     return most_bought_product
+
+
+def generate_period_invoice_pdf(period_invoice: PeriodInvoice) -> bytes:
+    """Render a period invoice as PDF: header, period and the frozen sums per user"""
+    buffer = io.BytesIO()
+    title = "Invoice #{}".format(period_invoice.pk)
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=20 * mm,
+        rightMargin=20 * mm,
+        topMargin=20 * mm,
+        bottomMargin=20 * mm,
+        title=title,
+        author=PybarsysPreferences.EMAIL.NAME_OF_BAR,
+    )
+    styles = getSampleStyleSheet()
+
+    if period_invoice.period_start is None:
+        period_start = "first purchase"
+    else:
+        period_start = sdatetime(localtime(period_invoice.period_start))
+
+    story = [
+        Paragraph(escape(PybarsysPreferences.EMAIL.NAME_OF_BAR), styles["Normal"]),
+        Paragraph(title, styles["Title"]),
+        Paragraph(
+            "Purchases by user from {} to {}".format(
+                period_start, sdatetime(localtime(period_invoice.period_end))
+            ),
+            styles["Normal"],
+        ),
+        Paragraph(
+            "Created: {}".format(sdatetime(localtime(period_invoice.created_date))),
+            styles["Normal"],
+        ),
+    ]
+    if period_invoice.comment:
+        story.append(Spacer(1, 4 * mm))
+        story.append(
+            Paragraph(
+                escape(period_invoice.comment).replace("\n", "<br/>"), styles["Normal"]
+            )
+        )
+    story.append(Spacer(1, 8 * mm))
+
+    rows = [
+        [
+            "User",
+            "Number of\npurchases",
+            "Average\nquantity",
+            "Total\nquantity",
+            "Average\ncost",
+            "Total sales",
+        ]
+    ]
+    for line in period_invoice.lines.all():
+        rows.append(
+            [
+                line.user_display_name,
+                line.num_purchases,
+                line.average_quantity(),
+                line.total_quantity,
+                currency(line.average_cost()),
+                currency(line.total_sales),
+            ]
+        )
+    totals = period_invoice.totals()
+    rows.append(
+        [
+            "Total",
+            totals["num_purchases"],
+            totals["average_quantity"],
+            totals["total_quantity"],
+            currency(totals["average_cost"]),
+            currency(totals["total_sales"]),
+        ]
+    )
+
+    table = Table(
+        rows,
+        colWidths=[55 * mm, 22 * mm, 20 * mm, 20 * mm, 22 * mm, 31 * mm],
+        repeatRows=1,
+    )
+    table.setStyle(
+        TableStyle(
+            [
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+                ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+                ("VALIGN", (0, 0), (-1, -1), "BOTTOM"),
+                ("LINEBELOW", (0, 0), (-1, 0), 1, colors.black),
+                ("LINEABOVE", (0, -1), (-1, -1), 1, colors.black),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -2), [colors.white, colors.whitesmoke]),
+            ]
+        )
+    )
+    story.append(table)
+
+    def draw_page_number(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.drawRightString(
+            A4[0] - 20 * mm,
+            10 * mm,
+            "{} - page {}".format(title, doc.page),
+        )
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=draw_page_number, onLaterPages=draw_page_number)
+    return buffer.getvalue()

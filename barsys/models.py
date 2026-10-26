@@ -629,6 +629,32 @@ class PurchaseQuerySet(models.QuerySet):
         else:
             return 0
 
+    def in_period(self, period_start, period_end):
+        """Purchases made after period_start (exclusive, None = no lower bound) up to
+        and including period_end
+        """
+        purchases = self.filter(created_date__lte=period_end)
+        if period_start is not None:
+            purchases = purchases.filter(created_date__gt=period_start)
+        return purchases
+
+    def sums_by_user(self):
+        """List of dicts (user, user__display_name, num_purchases, total_quantity,
+        total_sales), most total sales first
+        """
+        return list(
+            self.values("user", "user__display_name")
+            .annotate(
+                num_purchases=models.Count("id"),
+                total_quantity=models.Sum("quantity"),
+                total_sales=models.Sum(
+                    F("quantity") * F("product_price"),
+                    output_field=DecimalField(decimal_places=2),
+                ),
+            )
+            .order_by("-total_sales", "user__display_name")
+        )
+
     def stats_purchases_by_category_and_product(self):
         """Calculate sum of purchases of each product and group by category and product
         Limit parameter would not make a lot of sense here
@@ -1290,3 +1316,170 @@ class SiteSettings(models.Model):
     def get(cls) -> "SiteSettings":
         obj, _ = cls.objects.get_or_create(pk=1)
         return obj
+
+
+class PeriodInvoiceManager(models.Manager):
+    def period_start_for(self, period_end):
+        """Where a period invoice ending at period_end starts: at the end of the latest
+        period invoice before it (None if there is none, i.e. from the first purchase on)
+        """
+        return self.filter(period_end__lt=period_end).aggregate(
+            latest_end=models.Max("period_end")
+        )["latest_end"]
+
+    def covering(self, period_end):
+        """Period invoices whose period already contains period_end"""
+        return self.filter(
+            Q(period_start__isnull=True) | Q(period_start__lt=period_end),
+            period_end__gte=period_end,
+        )
+
+    def check_period_end(self, period_end):
+        """Raise ValidationError if a period invoice may not end at period_end"""
+        if period_end > timezone.now():
+            # Purchases made later would fall into the period, but miss its frozen sums
+            raise ValidationError("A period invoice cannot end in the future.")
+        covering = self.covering(period_end).first()
+        if covering is not None:
+            raise ValidationError(
+                "This time is already covered by {} - delete it first or choose "
+                "another time.".format(covering)
+            )
+
+    def create_until(self, period_end, comment=""):
+        """Create a period invoice over all purchases since the latest one before
+        period_end up to period_end, freezing the sums per user as lines.
+
+        Free item purchases are left out, like on the purchase statistics pages.
+
+        period_end is cut to whole seconds, so that the boundaries can be typed into a
+        time input - e.g. to cover the gap left by a deleted period invoice exactly.
+        Purchases within the cut-off fraction of a second go to the next one.
+        """
+        period_end = period_end.replace(microsecond=0)
+        with transaction.atomic():
+            self.check_period_end(period_end)
+            period_start = self.period_start_for(period_end)
+
+            period_invoice = self.create(
+                period_start=period_start, period_end=period_end, comment=comment
+            )
+            purchases = Purchase.objects.filter(is_free_item_purchase=False)
+            PeriodInvoiceLine.objects.bulk_create(
+                [
+                    PeriodInvoiceLine(
+                        period_invoice=period_invoice,
+                        user_id=s["user"],
+                        user_display_name=s["user__display_name"],
+                        num_purchases=s["num_purchases"],
+                        total_quantity=s["total_quantity"],
+                        # see User.account_balance() on why SQLite sums need rounding
+                        total_sales=round(s["total_sales"], 2),
+                    )
+                    for s in purchases.in_period(
+                        period_start, period_end
+                    ).sums_by_user()
+                ]
+            )
+
+        return period_invoice
+
+
+class PeriodInvoice(models.Model):
+    """Sum of all purchases per user over a period, which ends where the next one begins.
+
+    Unlike Invoice, this does not bill anything: purchases, payments and balances are
+    left untouched. The sums are frozen as PeriodInvoiceLines when it is created, so
+    later changes to purchases do not alter an issued period invoice.
+
+    Periods never overlap, but there may be gaps after a period invoice was deleted.
+    """
+
+    period_start = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Purchases after this time are included. "
+        "Empty for the first period invoice, which includes all earlier purchases.",
+    )
+    period_end = models.DateTimeField(
+        help_text="Purchases up to and including this time are included"
+    )
+    comment = models.TextField(blank=True, default="")
+
+    created_date = models.DateTimeField(auto_now_add=True)
+
+    objects = PeriodInvoiceManager()
+
+    class Meta:
+        ordering = ["-period_end"]
+
+    def __str__(self):
+        return "Period invoice #{} over {} until {}".format(
+            self.pk,
+            currency(self.totals()["total_sales"]),
+            formats.date_format(localtime(self.period_end), "SHORT_DATETIME_FORMAT"),
+        )
+
+    def totals(self):
+        """Same keys as the lines, plus averages per purchase like on the purchase
+        statistics pages
+        """
+        totals = self.lines.aggregate(
+            num_purchases=models.Sum("num_purchases"),
+            total_quantity=models.Sum("total_quantity"),
+            total_sales=models.Sum("total_sales"),
+        )
+        totals = {k: v or 0 for k, v in totals.items()}
+        totals["total_sales"] = round(Decimal(totals["total_sales"]), 2)
+        totals["average_quantity"] = _average(
+            totals["total_quantity"], totals["num_purchases"]
+        )
+        totals["average_cost"] = _average(
+            totals["total_sales"], totals["num_purchases"]
+        )
+        return totals
+
+    def get_absolute_url(self):
+        return reverse("admin_periodinvoice_detail", kwargs={"pk": self.pk})
+
+    def cannot_be_deleted(self):
+        # Nothing is billed by a period invoice, so it can always go. Its period can be
+        # covered again by creating a new one ending at the same time.
+        return False
+
+    def is_latest(self):
+        return not PeriodInvoice.objects.filter(period_end__gt=self.period_end).exists()
+
+
+def _average(total, count):
+    if not count:
+        return Decimal("0")
+    return (Decimal(total) / count).quantize(Decimal("0.01"))
+
+
+class PeriodInvoiceLine(models.Model):
+    """Frozen purchase sums of one user within a PeriodInvoice"""
+
+    period_invoice = models.ForeignKey(
+        PeriodInvoice, on_delete=models.CASCADE, related_name="lines"
+    )
+    # The display name is kept as well, so the line stays readable if the user is
+    # renamed or deleted later on
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+    user_display_name = models.CharField(max_length=40)
+
+    num_purchases = models.PositiveIntegerField()
+    total_quantity = models.PositiveIntegerField()
+    total_sales = models.DecimalField(max_digits=9, decimal_places=2)
+
+    class Meta:
+        ordering = ["-total_sales", "user_display_name"]
+
+    def __str__(self):
+        return "{}: {}".format(self.user_display_name, currency(self.total_sales))
+
+    def average_quantity(self):
+        return _average(self.total_quantity, self.num_purchases)
+
+    def average_cost(self):
+        return _average(self.total_sales, self.num_purchases)

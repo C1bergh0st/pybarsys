@@ -1,0 +1,44 @@
+{% extends 'barsys/admin/base.html' %}
+
+{% load crispy_forms_tags %}
+{% load barsys_helpers %}
+
+{% block content %}
+    <h1>{{ title }}</h1>
+
+    {% crispy form %}
+
+    {% if period_end %}
+        <h3>Preview</h3>
+        <p>
+            Purchases after <strong>{{ period_start|date:"Y-m-d H:i:s"|default:"the first purchase" }}</strong>
+            up to and including <strong>{{ period_end|date:"Y-m-d H:i:s" }}</strong>. Free item purchases are not included.
+        </p>
+        <div class="table-responsive" style="overflow-x: inherit;">
+            <table class="table table-striped">
+                <thead>
+                <tr>
+                    <th>User</th>
+                    <th>Number of purchases</th>
+                    <th>Total quantity</th>
+                    <th>Total sales</th>
+                </tr>
+                </thead>
+                <tbody>
+                {% for line in preview_lines %}
+                    <tr>
+                        <td>{{ line.user__display_name }}</td>
+                        <td>{{ line.num_purchases }}</td>
+                        <td>{{ line.total_quantity }}</td>
+                        <td>{{ line.total_sales|currency }}</td>
+                    </tr>
+                {% empty %}
+                    <tr>
+                        <td colspan="4">No purchases in this period.</td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    {% endif %}
+{% endblock %}

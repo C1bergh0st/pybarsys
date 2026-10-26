@@ -22,7 +22,9 @@ from django.shortcuts import render
 from django.template.loader import render_to_string
 from django.urls import reverse, reverse_lazy
 from django.utils.text import Truncator
-from django.views.generic import edit, View, TemplateView
+from django.utils import timezone
+from django.utils.timezone import localtime
+from django.views.generic import edit, ListView, View, TemplateView
 from django.views.generic.detail import DetailView
 from django_filters.views import FilterView
 from easyverein import EasyvereinAPI
@@ -1002,6 +1004,121 @@ class UserStatisticsByAccountBalance(UserIsAdminMixin, FilterView):
 
 
 # Statistics END
+# PeriodInvoice BEGIN
+
+
+class PeriodInvoiceListView(UserIsAdminMixin, ListView):
+    model = PeriodInvoice
+    template_name = "barsys/admin/periodinvoice_list.html"
+    paginate_by = 10
+
+
+class PeriodInvoiceCreateUntilNowView(UserIsAdminMixin, edit.CreateView):
+    model = PeriodInvoice
+    form_class = PeriodInvoiceCreateForm
+    template_name = "barsys/admin/periodinvoice_new.html"
+    title = "Create invoice until now"
+
+    def get_period_end(self, form):
+        """End of the invoice to preview or create, None if it is not known yet"""
+        return timezone.now().replace(microsecond=0)
+
+    @staticmethod
+    def _purchases(period_start, period_end):
+        return Purchase.objects.filter(is_free_item_purchase=False).in_period(
+            period_start, period_end
+        )
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["title"] = self.title
+        period_end = self.get_period_end(context["form"])
+        if period_end is not None:
+            period_start = PeriodInvoice.objects.period_start_for(period_end)
+            context["period_start"] = period_start
+            context["period_end"] = period_end
+            context["preview_lines"] = self._purchases(
+                period_start, period_end
+            ).sums_by_user()
+        return context
+
+    def form_valid(self, form):
+        if "preview" in self.request.POST:
+            return self.render_to_response(self.get_context_data(form=form))
+
+        period_end = self.get_period_end(form)
+        period_start = PeriodInvoice.objects.period_start_for(period_end)
+        if not self._purchases(period_start, period_end).exists():
+            messages.info(
+                self.request,
+                "No invoice created: there were no purchases in this period.",
+            )
+            return self.render_to_response(self.get_context_data(form=form))
+        try:
+            self.object = PeriodInvoice.objects.create_until(
+                period_end, comment=form.cleaned_data["comment"]
+            )
+        except exceptions.ValidationError as e:
+            form.add_error(None, e)
+            return self.form_invalid(form)
+        messages.success(self.request, "Created {}".format(self.object))
+        return HttpResponseRedirect(self.object.get_absolute_url())
+
+
+class PeriodInvoiceCreateUntilView(PeriodInvoiceCreateUntilNowView):
+    form_class = PeriodInvoiceCreateUntilForm
+    title = "Create invoice until date and time"
+
+    def get_period_end(self, form):
+        if form.is_bound and form.is_valid():
+            return form.cleaned_data["period_end"]
+        return None
+
+
+class PeriodInvoiceDetailView(UserIsAdminMixin, DetailView):
+    model = PeriodInvoice
+    template_name = "barsys/admin/periodinvoice_detail.html"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["totals"] = self.object.totals()
+        return context
+
+
+class PeriodInvoicePdfView(UserIsAdminMixin, View):
+    def get(self, request, pk):
+        period_invoice = get_object_or_404(PeriodInvoice, pk=pk)
+        response = HttpResponse(
+            view_helpers.generate_period_invoice_pdf(period_invoice),
+            content_type="application/pdf",
+        )
+        # Shown in the browser unless explicitly downloaded
+        disposition = "attachment" if request.GET.get("download") else "inline"
+        response["Content-Disposition"] = '{}; filename="invoice_{}_{}.pdf"'.format(
+            disposition,
+            period_invoice.pk,
+            localtime(period_invoice.period_end).strftime("%Y-%m-%d"),
+        )
+        return response
+
+
+class PeriodInvoiceDeleteView(UserIsAdminMixin, CheckedDeleteView):
+    success_url = reverse_lazy("admin_periodinvoice_list")
+    cancel_url = reverse_lazy("admin_periodinvoice_list")
+    model = PeriodInvoice
+
+    def get_extra_notices(self) -> list[str]:
+        if self.object.is_latest():
+            return []
+        return [
+            "Purchases of this period will not be on any invoice anymore. To cover "
+            "them again, create an invoice until the date and time {}.".format(
+                localtime(self.object.period_end).strftime("%Y-%m-%d %H:%M:%S")
+            )
+        ]
+
+
+# PeriodInvoice END
 # ProductAutochangeSet BEGIN
 
 

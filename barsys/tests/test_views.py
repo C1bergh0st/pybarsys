@@ -5,6 +5,7 @@ from django.contrib.messages import get_messages
 from django.core import mail
 from django.test import TestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 
 from barsys.forms import UserCreateForm, UserUpdateForm
 from barsys.models import *
@@ -171,6 +172,16 @@ class AdminViewSmokeTest(TestCase):
         self._assert_200(reverse("admin_purchase_statistics_by_user"))
         self._assert_200(reverse("admin_user_statistics_by_account_balance"))
 
+    def test_periodinvoice_pages(self):
+        period_invoice = PeriodInvoice.objects.create_until(timezone.now())
+        pk = period_invoice.pk
+        self._assert_200(reverse("admin_periodinvoice_list"))
+        self._assert_200(reverse("admin_periodinvoice_new_until_now"))
+        self._assert_200(reverse("admin_periodinvoice_new_until"))
+        self._assert_200(reverse("admin_periodinvoice_detail", kwargs={"pk": pk}))
+        self._assert_200(reverse("admin_periodinvoice_pdf", kwargs={"pk": pk}))
+        self._assert_200(reverse("admin_periodinvoice_delete", kwargs={"pk": pk}))
+
     def test_unauthenticated_redirects(self):
         self.client.logout()
         # Statistics pages are included because they expose names and balances, and
@@ -181,6 +192,9 @@ class AdminViewSmokeTest(TestCase):
             "admin_purchase_statistics_by_product",
             "admin_purchase_statistics_by_user",
             "admin_user_statistics_by_account_balance",
+            "admin_periodinvoice_list",
+            "admin_periodinvoice_new_until_now",
+            "admin_periodinvoice_new_until",
         ):
             response = self.client.get(reverse(name))
             self.assertEqual(response.status_code, 302, "{} is public".format(name))
@@ -882,3 +896,262 @@ class UserSettleBalanceViewTest(TestCase):
         self.assertIn(
             "does not pay for their own purchases", " ".join(self._messages(response))
         )
+
+
+class PeriodInvoiceTest(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            "admin@example.com", "Admin", "password"
+        )
+        self.client.login(username="admin@example.com", password="password")
+
+        cat = Category.objects.create(name="Drinks")
+        self.cola = Product.objects.create(
+            category=cat, name="Cola", price="1.50", amount="0.5 l"
+        )
+        self.alice = User.objects.create_user("alice@example.com", "Alice", "pw")
+        self.bob = User.objects.create_user("bob@example.com", "Bob", "pw")
+
+        # Whole seconds, like the boundaries of period invoices
+        self.t0 = (timezone.now() - datetime.timedelta(days=10)).replace(microsecond=0)
+
+    def _purchase(self, user, quantity, days, **kwargs):
+        """Purchase made `days` after self.t0"""
+        purchase = Purchase.objects.create_from_product(
+            self.cola, user=user, quantity=quantity, **kwargs
+        )
+        # created_date is auto_now_add, so it can only be backdated afterwards
+        Purchase.objects.filter(pk=purchase.pk).update(
+            created_date=self.t0 + datetime.timedelta(days=days)
+        )
+        return purchase
+
+    def _at(self, days):
+        return self.t0 + datetime.timedelta(days=days)
+
+    def test_first_invoice_covers_all_earlier_purchases_by_user(self):
+        self._purchase(self.alice, 2, days=1)
+        self._purchase(self.alice, 1, days=2)
+        self._purchase(self.bob, 1, days=3)
+
+        period_invoice = PeriodInvoice.objects.create_until(self._at(5))
+
+        self.assertIsNone(period_invoice.period_start)
+        lines = list(period_invoice.lines.all())
+        self.assertEqual(
+            [(line.user, line.num_purchases, line.total_quantity) for line in lines],
+            [(self.alice, 2, 3), (self.bob, 1, 1)],
+        )
+        self.assertEqual(lines[0].total_sales, Decimal("4.50"))
+        self.assertEqual(lines[0].average_cost(), Decimal("2.25"))
+        self.assertEqual(period_invoice.totals()["total_sales"], Decimal("6.00"))
+
+    def test_next_invoice_starts_where_the_previous_one_ended(self):
+        self._purchase(self.alice, 1, days=1)
+        first = PeriodInvoice.objects.create_until(self._at(5))
+        # Exactly at the boundary belongs to the earlier invoice
+        Purchase.objects.update(created_date=self._at(5))
+        self._purchase(self.bob, 4, days=6)
+        self._purchase(self.alice, 1, days=8)
+
+        second = PeriodInvoice.objects.create_until(self._at(7))
+
+        self.assertEqual(second.period_start, first.period_end)
+        self.assertEqual(
+            [(line.user, line.total_quantity) for line in second.lines.all()],
+            [(self.bob, 4)],
+        )
+        self.assertEqual(first.lines.get().user, self.alice)
+
+    def test_periods_cannot_overlap(self):
+        PeriodInvoice.objects.create_until(self._at(5))
+        for days in (5, 3):
+            with self.assertRaises(ValidationError):
+                PeriodInvoice.objects.create_until(self._at(days))
+
+    def test_period_cannot_end_in_the_future(self):
+        with self.assertRaises(ValidationError):
+            PeriodInvoice.objects.create_until(timezone.now() + datetime.timedelta(1))
+
+    def test_gap_of_deleted_invoice_can_be_covered_again(self):
+        self._purchase(self.alice, 1, days=1)
+        self._purchase(self.bob, 2, days=3)
+        self._purchase(self.alice, 3, days=5)
+        first = PeriodInvoice.objects.create_until(self._at(2))
+        second = PeriodInvoice.objects.create_until(self._at(4))
+        third = PeriodInvoice.objects.create_until(self._at(6))
+
+        # any invoice can be deleted, not only the latest one
+        self.assertFalse(second.cannot_be_deleted())
+        self.client.post(
+            reverse("admin_periodinvoice_delete", kwargs={"pk": second.pk})
+        )
+        self.assertFalse(PeriodInvoice.objects.filter(pk=second.pk).exists())
+
+        # an end inside the later invoice's period would overlap it
+        with self.assertRaises(ValidationError):
+            PeriodInvoice.objects.create_until(self._at(5))
+
+        refill = PeriodInvoice.objects.create_until(self._at(4))
+        self.assertEqual(refill.period_start, first.period_end)
+        self.assertEqual(refill.lines.get().user, self.bob)
+        self.assertEqual(third.period_start, refill.period_end)
+
+    def test_delete_page_warns_about_gap(self):
+        first = PeriodInvoice.objects.create_until(self._at(2))
+        latest = PeriodInvoice.objects.create_until(self._at(4))
+        url = "admin_periodinvoice_delete"
+
+        response = self.client.get(reverse(url, kwargs={"pk": first.pk}))
+        self.assertTrue(response.context["extra_notices"])
+        response = self.client.get(reverse(url, kwargs={"pk": latest.pk}))
+        self.assertFalse(response.context["extra_notices"])
+
+    def test_free_item_purchases_are_left_out(self):
+        self._purchase(self.alice, 1, days=1)
+        self._purchase(self.bob, 3, days=1, is_free_item_purchase=True)
+
+        period_invoice = PeriodInvoice.objects.create_until(self._at(5))
+
+        self.assertEqual(period_invoice.lines.get().user, self.alice)
+
+    def test_lines_are_frozen(self):
+        purchase = self._purchase(self.alice, 2, days=1)
+        period_invoice = PeriodInvoice.objects.create_until(self._at(5))
+
+        purchase.delete()
+        self.alice.display_name = "Alicia"
+        self.alice.save()
+
+        line = period_invoice.lines.get()
+        self.assertEqual(line.user_display_name, "Alice")
+        self.assertEqual(line.total_sales, Decimal("3.00"))
+
+    def test_does_not_bill_anything(self):
+        self._purchase(self.alice, 2, days=1)
+        PeriodInvoice.objects.create_until(self._at(5))
+
+        self.assertTrue(Purchase.objects.unbilled().exists())
+        self.assertEqual(self.alice.account_balance(), 0)
+
+    @staticmethod
+    def _local_input(dt):
+        """dt as typed into the date and time input"""
+        return timezone.localtime(dt).strftime("%Y-%m-%dT%H:%M:%S")
+
+    def test_period_end_is_cut_to_whole_seconds(self):
+        period_invoice = PeriodInvoice.objects.create_until(
+            self._at(5) + datetime.timedelta(microseconds=1234)
+        )
+        self.assertEqual(period_invoice.period_end, self._at(5))
+
+    def test_create_until_now_view(self):
+        self._purchase(self.alice, 2, days=1)
+        url = reverse("admin_periodinvoice_new_until_now")
+
+        response = self.client.get(url)
+        self.assertEqual(
+            [line["user"] for line in response.context["preview_lines"]],
+            [self.alice.pk],
+        )
+
+        response = self.client.post(url, {"comment": "October"})
+
+        period_invoice = PeriodInvoice.objects.get()
+        self.assertRedirects(response, period_invoice.get_absolute_url())
+        self.assertEqual(period_invoice.comment, "October")
+        self.assertEqual(period_invoice.period_end.microsecond, 0)
+        self.assertEqual(period_invoice.lines.get().user, self.alice)
+
+    def test_create_until_now_view_refuses_empty_period(self):
+        self._purchase(self.alice, 2, days=1)
+        PeriodInvoice.objects.create_until(self._at(5))
+
+        response = self.client.post(reverse("admin_periodinvoice_new_until_now"), {})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(PeriodInvoice.objects.count(), 1)
+
+    def test_create_until_view(self):
+        self._purchase(self.alice, 2, days=1)
+        self._purchase(self.bob, 1, days=3)
+
+        self.client.post(
+            reverse("admin_periodinvoice_new_until"),
+            {"period_end": self._local_input(self._at(2))},
+        )
+
+        period_invoice = PeriodInvoice.objects.get()
+        self.assertEqual(period_invoice.period_end, self._at(2))
+        self.assertEqual(period_invoice.lines.get().user, self.alice)
+
+    def test_create_until_view_preview_does_not_create(self):
+        self._purchase(self.alice, 2, days=1)
+        url = reverse("admin_periodinvoice_new_until")
+
+        response = self.client.get(url)
+        self.assertNotIn("preview_lines", response.context)
+
+        response = self.client.post(
+            url, {"period_end": self._local_input(self._at(2)), "preview": "1"}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(PeriodInvoice.objects.exists())
+        self.assertEqual(
+            [line["user"] for line in response.context["preview_lines"]],
+            [self.alice.pk],
+        )
+
+    def test_create_until_view_rejects_covered_and_future_times(self):
+        self._purchase(self.alice, 2, days=1)
+        PeriodInvoice.objects.create_until(self._at(5))
+
+        for period_end in (
+            self._at(3),
+            self._at(5),
+            timezone.now() + datetime.timedelta(hours=2),
+        ):
+            response = self.client.post(
+                reverse("admin_periodinvoice_new_until"),
+                {"period_end": self._local_input(period_end)},
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("period_end", response.context["form"].errors)
+        self.assertEqual(PeriodInvoice.objects.count(), 1)
+
+    def test_gap_can_be_covered_exactly_by_time(self):
+        self._purchase(self.alice, 1, days=1)
+        self._purchase(self.bob, 2, days=3)
+        first = PeriodInvoice.objects.create_until(self._at(2))
+        # Ends at an odd time, as an invoice until now does
+        middle = PeriodInvoice.objects.create_until(
+            self._at(3) + datetime.timedelta(hours=1, seconds=17)
+        )
+        third = PeriodInvoice.objects.create_until(self._at(6))
+        middle.delete()
+
+        self.client.post(
+            reverse("admin_periodinvoice_new_until"),
+            {"period_end": self._local_input(middle.period_end)},
+        )
+
+        refill = PeriodInvoice.objects.exclude(pk__in=[first.pk, third.pk]).get()
+        self.assertEqual(refill.period_start, first.period_end)
+        self.assertEqual(refill.period_end, third.period_start)
+        self.assertEqual(refill.lines.get().user, self.bob)
+
+    def test_pdf(self):
+        self._purchase(self.alice, 2, days=1)
+        period_invoice = PeriodInvoice.objects.create_until(
+            self._at(5), comment="Line 1\n<b>Line & 2</b>"
+        )
+        url = reverse("admin_periodinvoice_pdf", kwargs={"pk": period_invoice.pk})
+
+        response = self.client.get(url)
+        self.assertEqual(response["Content-Type"], "application/pdf")
+        self.assertTrue(response["Content-Disposition"].startswith("inline"))
+        self.assertTrue(response.content.startswith(b"%PDF"))
+
+        response = self.client.get(url + "?download=1")
+        self.assertTrue(response["Content-Disposition"].startswith("attachment"))

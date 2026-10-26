@@ -1,0 +1,94 @@
+{% extends 'barsys/admin/base.html' %}
+
+{% load bootstrap3 %}
+{% load barsys_helpers %}
+{% load humanize %}
+
+{% block content %}
+    <div>
+        <h1 class="pull-left" style="margin-top: 0;">Invoice #{{ periodinvoice.pk }}</h1>
+        <div class="btn-group pull-right" role="group">
+            <a href="{% url 'admin_periodinvoice_pdf' periodinvoice.pk %}" target="_blank" class="btn btn-primary">
+                {% bootstrap_icon 'file' %} View PDF
+            </a>
+            <a href="{% url 'admin_periodinvoice_pdf' periodinvoice.pk %}?download=1" class="btn btn-default">
+                {% bootstrap_icon 'download-alt' %} Download PDF
+            </a>
+            {% if periodinvoice.cannot_be_deleted %}
+                <button class="btn btn-danger" disabled title="{{ periodinvoice.cannot_be_deleted }}">
+                    {% bootstrap_icon 'remove-sign' %} Delete
+                </button>
+            {% else %}
+                <a href="{% url 'admin_periodinvoice_delete' periodinvoice.pk %}" class="btn btn-danger">
+                    {% bootstrap_icon 'remove-sign' %} Delete
+                </a>
+            {% endif %}
+        </div>
+    </div>
+    <div class="table-responsive" style="overflow-x: inherit; clear: both;">
+        <table class="table">
+            <tbody>
+            <tr>
+                <th>From</th>
+                <td>{{ periodinvoice.period_start|default_if_none:"First purchase" }}</td>
+            </tr>
+            <tr>
+                <th>To</th>
+                <td>{{ periodinvoice.period_end }}</td>
+            </tr>
+            <tr>
+                <th>Created</th>
+                <td>{{ periodinvoice.created_date }}</td>
+            </tr>
+            {% if periodinvoice.comment %}
+                <tr>
+                    <th>Comment</th>
+                    <td>{{ periodinvoice.comment|linebreaksbr }}</td>
+                </tr>
+            {% endif %}
+            </tbody>
+        </table>
+    </div>
+
+    <h3>Purchases by user</h3>
+    <div class="table-responsive" style="overflow-x: inherit;">
+        <table class="table table-striped">
+            <thead>
+            <tr>
+                <th>User</th>
+                <th>Number of purchases</th>
+                <th>Average quantity</th>
+                <th>Total quantity</th>
+                <th>Average cost</th>
+                <th>Total sales</th>
+            </tr>
+            </thead>
+            <tbody>
+            {% for line in periodinvoice.lines.all %}
+                <tr>
+                    <td>
+                        {% if line.user_id %}
+                            <a href="{% url 'admin_user_detail' line.user_id %}">{{ line.user_display_name }}</a>
+                        {% else %}
+                            {{ line.user_display_name }}
+                        {% endif %}
+                    </td>
+                    <td>{{ line.num_purchases }}</td>
+                    <td>{{ line.average_quantity|intcomma }}</td>
+                    <td>{{ line.total_quantity }}</td>
+                    <td>{{ line.average_cost|currency }}</td>
+                    <td>{{ line.total_sales|currency }}</td>
+                </tr>
+            {% endfor %}
+            <tr style="font-weight:bold; border-top:2px solid #DDDDDD;">
+                <td>Total</td>
+                <td>{{ totals.num_purchases }}</td>
+                <td>{{ totals.average_quantity|intcomma }}</td>
+                <td>{{ totals.total_quantity }}</td>
+                <td>{{ totals.average_cost|currency }}</td>
+                <td>{{ totals.total_sales|currency }}</td>
+            </tr>
+            </tbody>
+        </table>
+    </div>
+{% endblock %}
